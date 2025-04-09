@@ -1,0 +1,237 @@
+name: Sync Upstream and Build
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+on:
+  schedule:
+    - cron: '0 */12 * * *' # 每12小时运行一次
+  workflow_dispatch: # 允许手动触发
+  push:
+    tags:
+      - 'v*' # 当推送版本标签时也触发
+
+jobs:
+  sync_and_build:
+    name: Sync Upstream and Build
+    runs-on: ubuntu-latest
+    if: ${{ github.event.repository.fork || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+
+    steps:
+      # 第一部分：同步上游仓库
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clean issue notice
+        uses: actions-cool/issues-helper@v3
+        with:
+          actions: 'close-issues'
+          labels: '🚨 Sync Fail'
+
+      - name: Sync upstream changes
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
+        with:
+          upstream_sync_repo: lobehub/lobe-chat
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
+
+      # 第二部分：构建项目
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: latest
+
+      - name: Setup bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: pnpm install
+
+      # 检查项目结构和构建配置
+      - name: Check project structure
+        run: |
+          echo "Current directory structure:"
+          ls -la
+          echo "Package.json build script:"
+          cat package.json | grep -A 5 '"scripts"'
+          echo "Checking for build output configuration:"
+          cat package.json | grep -A 10 '"build"'
+          if [ -f "next.config.js" ]; then
+            echo "Next.js config:"
+            cat next.config.js
+          fi
+          if [ -f "next.config.ts" ]; then
+            echo "Next.js TypeScript config:"
+            cat next.config.ts
+          fi
+
+      - name: Build
+        env:
+          NODE_OPTIONS: --max-old-space-size=32768 # 增加内存限制
+        run: pnpm run build
+
+      # 检查构建后的目录结构
+      - name: Check build output
+        run: |
+          echo "Directory structure after build:"
+          ls -la
+          echo "Checking for common build output directories:"
+          for dir in dist build out .next public; do
+            if [ -d "$dir" ]; then
+              echo "Found directory: $dir"
+              ls -la "$dir"
+            fi
+          done
+
+      # 第三部分：确定构建输出目录并将文件存储到dist分支
+      - name: Determine build output directory
+        id: build_dir
+        run: |
+          BUILD_DIR=""
+          # 检查常见的构建输出目录
+          for dir in dist build out .next; do
+            if [ -d "$dir" ]; then
+              BUILD_DIR="$dir"
+              echo "Found build directory: $BUILD_DIR"
+              break
+            fi
+          done
+          
+          if [ -z "$BUILD_DIR" ]; then
+            echo "No standard build directory found. Checking package.json for clues..."
+            OUTPUT_DIR=$(cat package.json | grep -o '"outDir":[^,]*' | cut -d'"' -f4)
+            if [ ! -z "$OUTPUT_DIR" ] && [ -d "$OUTPUT_DIR" ]; then
+              BUILD_DIR="$OUTPUT_DIR"
+              echo "Found build directory from package.json: $BUILD_DIR"
+            fi
+          fi
+          
+          if [ -z "$BUILD_DIR" ]; then
+            echo "Could not determine build directory. Using '.next' as fallback for Next.js projects."
+            if [ -d ".next" ]; then
+              BUILD_DIR=".next"
+            else
+              echo "Error: Could not find any build output directory."
+              exit 1
+            fi
+          fi
+          
+          echo "build_dir=$BUILD_DIR" >> $GITHUB_OUTPUT
+
+      - name: Create and switch to dist branch
+        run: |
+          BUILD_DIR="${{ steps.build_dir.outputs.build_dir }}"
+          echo "Using build directory: $BUILD_DIR"
+          
+          # 检查构建目录是否存在
+          if [ ! -d "$BUILD_DIR" ]; then
+            echo "Error: $BUILD_DIR folder does not exist. Build process may have failed."
+            exit 1
+          fi
+          
+          # 检查是否存在dist分支，如果不存在则创建
+          if ! git ls-remote --heads origin dist | grep dist; then
+            git checkout -b dist
+          else
+            git checkout -b temp_dist
+            git branch -D dist || true
+            git fetch origin dist
+            git checkout -b dist origin/dist
+            git merge temp_dist --no-edit || true
+            git branch -D temp_dist || true
+          fi
+
+      - name: Copy build files
+        run: |
+          BUILD_DIR="${{ steps.build_dir.outputs.build_dir }}"
+          echo "Copying files from $BUILD_DIR"
+          
+          # 保存构建目录
+          mkdir -p /tmp/nextjs-backup
+          cp -r $BUILD_DIR/* /tmp/nextjs-backup/ || true
+          
+          # 如果是Next.js项目，需要特殊处理
+          if [ "$BUILD_DIR" = ".next" ]; then
+            # 对于Next.js项目，我们需要复制更多文件
+            mkdir -p /tmp/nextjs-backup
+            cp -r .next /tmp/nextjs-backup/
+            cp -r public /tmp/nextjs-backup/ || true
+            cp package.json /tmp/nextjs-backup/ || true
+            cp next.config.js /tmp/nextjs-backup/ || true 2>/dev/null
+            cp next.config.ts /tmp/nextjs-backup/ || true 2>/dev/null
+          fi
+          
+          # 清空dist分支中的所有文件（保留.git目录）
+          find . -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} \;
+          
+          # 复制构建文件到根目录
+          if [ "$BUILD_DIR" = ".next" ]; then
+            # 对于Next.js项目
+            cp -r /tmp/nextjs-backup/* .
+          else
+            # 对于标准构建
+            cp -r /tmp/build-backup/* .
+          fi
+          
+          # 创建README.md说明这是构建分支
+          echo "# Dist Branch" > README.md
+          echo "This branch contains the built version of the lobe-chat application." >> README.md
+          echo "Last updated: $(date)" >> README.md
+          echo "Build directory used: $BUILD_DIR" >> README.md
+          
+          # 添加.nojekyll文件（如果需要GitHub Pages）
+          touch .nojekyll
+
+      - name: Commit and push build files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "🚀 Build: Update from upstream $(date +%Y-%m-%d)" || echo "No changes to commit"
+          git push -f origin dist
+
+      # 第四部分：同步失败处理
+      - name: Sync check
+        if: failure() && steps.sync.outcome == 'failure'
+        uses: actions-cool/issues-helper@v3
+        with:
+          actions: 'create-issue'
+          title: '🚨 同步失败 | Sync Fail'
+          labels: '🚨 Sync Fail'
+          body: |
+            Due to a change in the workflow file of the [LobeChat][lobechat] upstream repository, GitHub has automatically suspended the scheduled automatic update. You need to manually sync your fork. Please refer to the detailed [Tutorial][tutorial-en-US] for instructions.
+
+            由于 [LobeChat][lobechat] 上游仓库的 workflow 文件变更，导致 GitHub 自动暂停了本次自动更新，你需要手动 Sync Fork 一次，请查看 [详细教程][tutorial-zh-CN]
+
+            ![](https://github-production-user-asset-6210df.s3.amazonaws.com/17870709/273954625-df80c890-0822-4ac2-95e6-c990785cbed5.png)
+
+            [lobechat]: https://github.com/lobehub/lobe-chat
+            [tutorial-zh-CN]: https://github.com/lobehub/lobe-chat/wiki/Upstream-Sync.zh-CN
+            [tutorial-en-US]: https://github.com/lobehub/lobe-chat/wiki/Upstream-Sync
+
+      # 第五部分：构建失败处理
+      - name: Build check
+        if: failure() && steps.sync.outcome != 'failure'
+        uses: actions-cool/issues-helper@v3
+        with:
+          actions: 'create-issue'
+          title: '🚨 构建失败 | Build Fail'
+          labels: '🚨 Build Fail'
+          body: |
+            The build process has failed. Please check the workflow logs for more details.
+
+            构建过程失败。请查看工作流日志以获取更多详细信息。
