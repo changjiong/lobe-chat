@@ -97,7 +97,7 @@ jobs:
             fi
           done
 
-      # 第三部分：确定构建输出目录并将文件存储到dist分支
+      # 第三部分：确定构建输出目录并创建部署包
       - name: Determine build output directory
         id: build_dir
         run: |
@@ -132,79 +132,187 @@ jobs:
           
           echo "build_dir=$BUILD_DIR" >> $GITHUB_OUTPUT
 
-      - name: Create and switch to dist branch
+      # 第四部分：创建部署包并上传为GitHub Release
+      - name: Create deployment package
         run: |
           BUILD_DIR="${{ steps.build_dir.outputs.build_dir }}"
-          echo "Using build directory: $BUILD_DIR"
+          echo "Creating deployment package from $BUILD_DIR"
           
-          # 检查构建目录是否存在
-          if [ ! -d "$BUILD_DIR" ]; then
-            echo "Error: $BUILD_DIR folder does not exist. Build process may have failed."
-            exit 1
-          fi
+          # 创建部署目录
+          mkdir -p /tmp/deployment-package
           
-          # 检查是否存在dist分支，如果不存在则创建
-          if ! git ls-remote --heads origin dist | grep dist; then
-            git checkout -b dist
-          else
-            git checkout -b temp_dist
-            git branch -D dist || true
-            git fetch origin dist
-            git checkout -b dist origin/dist
-            git merge temp_dist --no-edit || true
-            git branch -D temp_dist || true
-          fi
-
-      - name: Copy build files
-        run: |
-          BUILD_DIR="${{ steps.build_dir.outputs.build_dir }}"
-          echo "Copying files from $BUILD_DIR"
-          
-          # 保存构建目录
-          mkdir -p /tmp/nextjs-backup
-          cp -r $BUILD_DIR/* /tmp/nextjs-backup/ || true
-          
-          # 如果是Next.js项目，需要特殊处理
-          if [ "$BUILD_DIR" = ".next" ]; then
-            # 对于Next.js项目，我们需要复制更多文件
-            mkdir -p /tmp/nextjs-backup
-            cp -r .next /tmp/nextjs-backup/
-            cp -r public /tmp/nextjs-backup/ || true
-            cp package.json /tmp/nextjs-backup/ || true
-            cp next.config.js /tmp/nextjs-backup/ || true 2>/dev/null
-            cp next.config.ts /tmp/nextjs-backup/ || true 2>/dev/null
-          fi
-          
-          # 清空dist分支中的所有文件（保留.git目录）
-          find . -mindepth 1 -maxdepth 1 -not -name '.git' -exec rm -rf {} \;
-          
-          # 复制构建文件到根目录
+          # 复制必要的文件到部署包
           if [ "$BUILD_DIR" = ".next" ]; then
             # 对于Next.js项目
-            cp -r /tmp/nextjs-backup/* .
+            cp -r .next /tmp/deployment-package/
+            cp -r public /tmp/deployment-package/ || true
+            cp package.json /tmp/deployment-package/
+            
+            # 复制Next.js配置文件（如果存在）
+            if [ -f "next.config.js" ]; then
+              cp next.config.js /tmp/deployment-package/
+            fi
+            if [ -f "next.config.ts" ]; then
+              cp next.config.ts /tmp/deployment-package/
+            fi
+            
+            # 创建.env文件（如果需要）
+            echo "NODE_ENV=production" > /tmp/deployment-package/.env
+            
+            # 创建启动脚本
+            cat > /tmp/deployment-package/start.sh << 'EOL'
+            #!/bin/bash
+            # 安装生产环境依赖
+            npm install --production
+            # 启动Next.js应用
+            npm start
+            EOL
+            
+            chmod +x /tmp/deployment-package/start.sh
+            
+            # 创建Dockerfile
+            cat > /tmp/deployment-package/Dockerfile << 'EOL'
+            FROM node:18-alpine
+            WORKDIR /app
+            COPY . .
+            RUN npm install --production
+            EXPOSE 3000
+            CMD ["npm", "start"]
+            EOL
+            
+            # 创建README.md
+            cat > /tmp/deployment-package/README.md << 'EOL'
+            # LobeChat Deployment Package
+
+            This package contains the production build of the LobeChat application.
+
+            ## How to Deploy
+
+            ### Using Node.js
+
+            1. Extract this package
+            2. Run the start script:
+               ```bash
+               ./start.sh
+               ```
+
+            ### Using Docker
+
+            1. Extract this package
+            2. Build and run the Docker container:
+               ```bash
+               docker build -t lobe-chat .
+               docker run -p 3000:3000 lobe-chat
+               ```
+
+            Last updated: $(date)
+            EOL
           else
             # 对于标准构建
-            cp -r /tmp/build-backup/* .
+            cp -r $BUILD_DIR/* /tmp/deployment-package/
+            
+            # 创建README.md
+            cat > /tmp/deployment-package/README.md << 'EOL'
+            # LobeChat Deployment Package
+
+            This package contains the production build of the LobeChat application.
+
+            ## How to Deploy
+
+            Serve the contents of this directory with a static file server.
+
+            Last updated: $(date)
+            EOL
           fi
           
-          # 创建README.md说明这是构建分支
-          echo "# Dist Branch" > README.md
-          echo "This branch contains the built version of the lobe-chat application." >> README.md
-          echo "Last updated: $(date)" >> README.md
-          echo "Build directory used: $BUILD_DIR" >> README.md
+          # 创建部署包压缩文件
+          cd /tmp
+          tar -czf lobe-chat-deployment.tar.gz -C deployment-package .
+          zip -r lobe-chat-deployment.zip deployment-package
           
-          # 添加.nojekyll文件（如果需要GitHub Pages）
-          touch .nojekyll
+          echo "Deployment package created:"
+          ls -la /tmp/lobe-chat-deployment.*
 
-      - name: Commit and push build files
+      # 使用GitHub Actions Artifacts存储构建文件
+      - name: Upload build as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: lobe-chat-build
+          path: /tmp/lobe-chat-deployment.tar.gz
+          retention-days: 30
+
+      # 创建GitHub Release并上传构建文件
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: build-${{ github.run_number }}
+          release_name: Build ${{ github.run_number }} ($(date +%Y-%m-%d))
+          body: |
+            This is an automated build of LobeChat from upstream.
+            
+            Build date: $(date)
+            Build number: ${{ github.run_number }}
+            
+            ## How to use
+            
+            1. Download the deployment package
+            2. Extract it to your server
+            3. Follow the instructions in the README.md file
+          draft: false
+          prerelease: false
+
+      - name: Upload Release Asset (tar.gz)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: /tmp/lobe-chat-deployment.tar.gz
+          asset_name: lobe-chat-deployment.tar.gz
+          asset_content_type: application/gzip
+
+      - name: Upload Release Asset (zip)
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: /tmp/lobe-chat-deployment.zip
+          asset_name: lobe-chat-deployment.zip
+          asset_content_type: application/zip
+
+      # 创建一个简单的索引页面，指向最新的构建
+      - name: Create index page for latest build
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "🚀 Build: Update from upstream $(date +%Y-%m-%d)" || echo "No changes to commit"
-          git push -f origin dist
+          mkdir -p public
+          cat > public/index.html << EOL
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>LobeChat Latest Build</title>
+            <meta http-equiv="refresh" content="0; url=https://github.com/${{ github.repository }}/releases/tag/build-${{ github.run_number }}">
+          </head>
+          <body>
+            <p>Redirecting to <a href="https://github.com/${{ github.repository }}/releases/tag/build-${{ github.run_number }}">latest build</a>...</p>
+          </body>
+          </html>
+          EOL
 
-      # 第四部分：同步失败处理
+      # 将索引页面推送到gh-pages分支
+      - name: Deploy index page to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          force_orphan: true
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'Update index page to point to latest build'
+
+      # 第五部分：同步失败处理
       - name: Sync check
         if: failure() && steps.sync.outcome == 'failure'
         uses: actions-cool/issues-helper@v3
@@ -223,7 +331,7 @@ jobs:
             [tutorial-zh-CN]: https://github.com/lobehub/lobe-chat/wiki/Upstream-Sync.zh-CN
             [tutorial-en-US]: https://github.com/lobehub/lobe-chat/wiki/Upstream-Sync
 
-      # 第五部分：构建失败处理
+      # 第六部分：构建失败处理
       - name: Build check
         if: failure() && steps.sync.outcome != 'failure'
         uses: actions-cool/issues-helper@v3
