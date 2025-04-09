@@ -181,7 +181,7 @@ jobs:
             EOL
             
             # 创建README.md
-            cat > /tmp/deployment-package/README.md << 'EOL'
+            cat > /tmp/deployment-package/README.md << EOL
             # LobeChat Deployment Package
 
             This package contains the production build of the LobeChat application.
@@ -192,18 +192,18 @@ jobs:
 
             1. Extract this package
             2. Run the start script:
-               ```bash
+               \`\`\`bash
                ./start.sh
-               ```
+               \`\`\`
 
             ### Using Docker
 
             1. Extract this package
             2. Build and run the Docker container:
-               ```bash
+               \`\`\`bash
                docker build -t lobe-chat .
                docker run -p 3000:3000 lobe-chat
-               ```
+               \`\`\`
 
             Last updated: $(date)
             EOL
@@ -212,7 +212,7 @@ jobs:
             cp -r $BUILD_DIR/* /tmp/deployment-package/
             
             # 创建README.md
-            cat > /tmp/deployment-package/README.md << 'EOL'
+            cat > /tmp/deployment-package/README.md << EOL
             # LobeChat Deployment Package
 
             This package contains the production build of the LobeChat application.
@@ -233,56 +233,34 @@ jobs:
           echo "Deployment package created:"
           ls -la /tmp/lobe-chat-deployment.*
 
-      # 使用GitHub Actions Artifacts存储构建文件
+      # 使用GitHub Actions Artifacts存储构建文件 - 更新到v4版本
       - name: Upload build as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: lobe-chat-build
           path: /tmp/lobe-chat-deployment.tar.gz
           retention-days: 30
 
-      # 创建GitHub Release并上传构建文件
+      # 创建GitHub Release并上传构建文件 - 使用更新的方法
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: build-${{ github.run_number }}
-          release_name: Build ${{ github.run_number }} ($(date +%Y-%m-%d))
-          body: |
-            This is an automated build of LobeChat from upstream.
-            
-            Build date: $(date)
-            Build number: ${{ github.run_number }}
-            
-            ## How to use
-            
-            1. Download the deployment package
-            2. Extract it to your server
-            3. Follow the instructions in the README.md file
-          draft: false
-          prerelease: false
-
-      - name: Upload Release Asset (tar.gz)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /tmp/lobe-chat-deployment.tar.gz
-          asset_name: lobe-chat-deployment.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Release Asset (zip)
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: /tmp/lobe-chat-deployment.zip
-          asset_name: lobe-chat-deployment.zip
-          asset_content_type: application/zip
+        run: |
+          BUILD_DATE=$(date +%Y-%m-%d)
+          RELEASE_TAG="build-${{ github.run_number }}"
+          RELEASE_NAME="Build ${{ github.run_number }} ($BUILD_DATE)"
+          RELEASE_BODY="This is an automated build of LobeChat from upstream.\n\nBuild date: $BUILD_DATE\nBuild number: ${{ github.run_number }}\n\n## How to use\n\n1. Download the deployment package\n2. Extract it to your server\n3. Follow the instructions in the README.md file"
+          
+          # 创建Release
+          gh release create "$RELEASE_TAG" \
+            --title "$RELEASE_NAME" \
+            --notes "$RELEASE_BODY" \
+            --repo "${{ github.repository }}"
+          
+          # 上传资产
+          gh release upload "$RELEASE_TAG" /tmp/lobe-chat-deployment.tar.gz /tmp/lobe-chat-deployment.zip \
+            --repo "${{ github.repository }}"
 
       # 创建一个简单的索引页面，指向最新的构建
       - name: Create index page for latest build
